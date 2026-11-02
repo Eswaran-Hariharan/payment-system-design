@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Payment System Design — High-Level Architecture</title>
+  <meta name="description" content="Designing a scalable, reliable, fault-tolerant payment system: idempotency, transactional outbox, Debezium CDC + Kafka, webhooks, and reconciliation." />
+  <script>(function(){ try { if (localStorage.getItem('ps-theme') === 'dark') document.documentElement.classList.add('dark'); } catch(e){} })();</script>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="progress" id="progress"></div>
+
+  <header class="hero">
+    <div class="hero-inner">
+      <button class="theme-btn" id="themeBtn" aria-label="Toggle dark mode" title="Toggle dark mode">🌙</button>
+      <p class="eyebrow">System Design · Payments · Reliability</p>
+      <h1>Payment System Design</h1>
+      <p class="lede">Designing a <strong>scalable, reliable, and fault-tolerant</strong> payment
+        system — handling concurrent requests, preventing duplicate payments, and ensuring reliable
+        event processing. Here are the key components and the design decisions behind them.</p>
+      <div class="hero-badges">
+        <span class="badge">Idempotency</span>
+        <span class="badge">Transactional Outbox</span>
+        <span class="badge">Debezium CDC + Kafka</span>
+        <span class="badge">Webhooks</span>
+        <span class="badge">Reconciliation</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="toc" id="toc" aria-label="Contents">
+      <h3>Contents</h3>
+      <ul>
+        <li><a href="#architecture">Architecture</a></li>
+        <li><a href="#gateway">1 · API Gateway</a></li>
+        <li><a href="#payment">2 · Payment Service &amp; Idempotency</a></li>
+        <li><a href="#orchestrator">3 · Payment Orchestrator</a></li>
+        <li><a href="#outbox">4 · Transactional Outbox</a></li>
+        <li><a href="#cdc">5 · Debezium CDC + Kafka</a></li>
+        <li><a href="#webhook">6 · Webhook Handler</a></li>
+        <li><a href="#reconciliation">7 · Reconciliation Workers</a></li>
+        <li><a href="#flow">Request flow</a></li>
+        <li><a href="#takeaways">Key takeaways</a></li>
+      </ul>
+    </aside>
+
+    <main class="content">
+      <article class="wrap">
+
+        <section id="architecture">
+          <h2>The architecture at a glance</h2>
+          <p>A payment request enters through the gateway, gets an idempotency guard at the payment
+            service, is authorized through an orchestrator talking to the bank, and emits events
+            reliably via an outbox that Debezium streams to Kafka. Webhooks and reconciliation close
+            the loop when things go wrong.</p>
+          <figure>
+            <img src="architecture.svg" alt="Payment system architecture: client, API gateway, payment service with Redis and SQL+outbox, orchestrator and bank, Debezium CDC to Kafka, downstream analytics and inventory, webhook handlers, and reconciliation workers" />
+            <figcaption>End-to-end flow — synchronous path (client → gateway → service → bank) and the asynchronous event path (outbox → CDC → Kafka → consumers).</figcaption>
+          </figure>
+          <div class="callout">
+            <strong>Functional requirements:</strong> create a payment · update payment status ·
+            support multiple methods (UPI / Cash / Netbanking / Card) · reconcile failed transactions ·
+            the whole system must be idempotent.<br/>
+            <strong>Non-functional:</strong> scalable · consistency over availability · payment writes
+            happen inside a transaction · payment events fan out to all services · plus fraud detection
+            and preventing unauthorized payments.
+          </div>
+        </section>
+
+        <section id="gateway">
+          <span class="kicker">Component 1</span>
+          <h2>API Gateway</h2>
+          <p>The single entry point for all payment requests. It's the front door, so it carries the
+            cross-cutting concerns that every request needs before it touches business logic.</p>
+          <ul>
+            <li><strong>Authentication</strong> — verify who is making the request.</li>
+            <li><strong>Rate limiting</strong> — protect downstream services from spikes and abuse.</li>
+            <li><strong>Request routing</strong> — send traffic to the right service.</li>
+          </ul>
+          <p>On the client side, the payment page is typically loaded in an <strong>IFRAME</strong>
+            that renders the available payment options, so sensitive card entry stays isolated.</p>
+        </section>
+
+        <section id="payment">
+          <span class="kicker">Component 2</span>
+          <h2>Payment Service &amp; Idempotency</h2>
+          <p>This service creates and manages payment transactions. Its hardest job is making sure a
+            retried or duplicated request never results in two charges. It uses a two-layer defense.</p>
+          <div class="cards two">
+            <div class="card red">
+              <h4>Redis — fast concurrent guard</h4>
+              <p>An atomic idempotency check in Redis stops two concurrent requests with the same
+                idempotency key from both starting to process. First one wins; the rest short-circuit.</p>
+            </div>
+            <div class="card amber">
+              <h4>SQL DB — durable guard</h4>
+              <p>Payment details (with the idempotency key) are persisted in SQL, giving durable
+                duplicate protection that survives restarts and cache loss.</p>
+            </div>
+          </div>
+          <div class="note">
+            <strong>Why both?</strong> Redis handles the race between simultaneous requests cheaply and
+            fast; the database is the source of truth that guarantees correctness even if Redis is
+            flushed or unavailable. Belt and suspenders.
+          </div>
+        </section>
+
+        <section id="orchestrator">
+          <span class="kicker">Component 3</span>
+          <h2>Payment Orchestrator</h2>
+          <p>Coordinates processing across different payment methods so the rest of the system doesn't
+            need to know the quirks of each one.</p>
+          <ul>
+            <li>Communicates with external <strong>payment gateways</strong>.</li>
+            <li>Handles payment <strong>authorization</strong> and <strong>status retrieval</strong>.</li>
+            <li>Drives the actual <strong>bank transaction</strong> — debiting the user's account and
+              crediting the merchant's.</li>
+          </ul>
+        </section>
+
+        <section id="outbox">
+          <span class="kicker">Component 4</span>
+          <h2>Transactional Outbox Pattern</h2>
+          <p>The classic problem: you update the payment record <em>and</em> you want to publish an
+            event to Kafka. If you do these as two separate steps and the app crashes in between, you
+            either lose the event or publish one for a transaction that never committed.</p>
+          <p>The outbox pattern solves this by writing the payment record <strong>and</strong> an event
+            row into an <strong>outbox table within the same database transaction</strong>. Either both
+            commit or neither does.</p>
+          <pre><code>BEGIN;
+  UPDATE payments
+     SET status = 'AUTHORIZED'
+   WHERE payment_id = :id;
+
+  INSERT INTO outbox (aggregate_id, type, payload)
+       VALUES (:id, 'PaymentAuthorized', :json);
+COMMIT;</code></pre>
+          <div class="takeaway">Because the event lives in the same transaction as the business change,
+            a crash before publishing can never lose the event — it's already durably committed, waiting
+            to be picked up.</div>
+        </section>
+
+        <section id="cdc">
+          <span class="kicker">Component 5</span>
+          <h2>Debezium CDC + Kafka</h2>
+          <p>Now the event is safely in the outbox table. A separate, asynchronous mechanism publishes
+            it — without the payment service having to call Kafka itself.</p>
+          <ul>
+            <li><strong>Debezium</strong> reads committed changes straight from the database transaction
+              log (CDC — change data capture), so it only ever sees data that actually committed.</li>
+            <li>It <strong>publishes those events to Kafka</strong> asynchronously.</li>
+            <li>Downstream services like <strong>Inventory</strong> and <strong>Analytics</strong>
+              consume independently and at their own pace.</li>
+          </ul>
+          <div class="note">
+            <strong>Consumers must be idempotent.</strong> Kafka gives at-least-once delivery, so the
+            same event can arrive more than once. Each consumer should dedupe (e.g. track processed
+            event IDs) so reprocessing is harmless.
+          </div>
+        </section>
+
+        <section id="webhook">
+          <span class="kicker">Component 6</span>
+          <h2>Webhook Handler</h2>
+          <p>Payment gateways report final outcomes asynchronously — the authorization you kicked off
+            may settle seconds or minutes later. The webhook handler receives those status updates.</p>
+          <ul>
+            <li>Receives asynchronous <strong>payment status updates</strong> from the gateway/bank.</li>
+            <li><strong>Handles duplicate notifications</strong> — gateways often send the same webhook
+              more than once — and updates payment status safely (idempotently).</li>
+            <li>Maintains a bidirectional link between the payment service and the merchant to keep both
+              sides in sync.</li>
+          </ul>
+        </section>
+
+        <section id="reconciliation">
+          <span class="kicker">Component 7</span>
+          <h2>Reconciliation Workers</h2>
+          <p>Even with all of the above, some transactions end up in an uncertain state — a timeout, a
+            crash, a webhook that never arrived. Reconciliation is the safety net.</p>
+          <ul>
+            <li><strong>Identify</strong> pending or uncertain transactions.</li>
+            <li><strong>Verify</strong> the actual payment status directly with the gateway.</li>
+            <li><strong>Prevent</strong> unnecessary retries and potential double charges by trusting
+              the gateway's authoritative answer.</li>
+          </ul>
+          <div class="takeaway">Reconciliation is what lets the system recover from crashes, timeouts,
+            and uncertain outcomes instead of guessing — it converges every transaction to its true
+            final state.</div>
+        </section>
+
+        <section id="flow">
+          <h2>Putting the flow together</h2>
+          <ol class="flow">
+            <li>Client loads the payment IFRAME; request hits the <strong>API Gateway</strong> (auth, rate limit).</li>
+            <li><strong>Payment Service</strong> checks the idempotency key in <strong>Redis</strong> (concurrent guard) and <strong>SQL</strong> (durable guard).</li>
+            <li>It writes the payment record <em>and</em> an outbox row in <strong>one transaction</strong>.</li>
+            <li><strong>Orchestrator</strong> authorizes through the gateway; the <strong>bank</strong> debits the user and credits the merchant.</li>
+            <li><strong>Debezium</strong> captures the committed outbox row and publishes to <strong>Kafka</strong>; <strong>Analytics</strong> and <strong>Inventory</strong> consume idempotently.</li>
+            <li>The <strong>Webhook Handler</strong> receives the gateway's final status (deduped) and updates the payment.</li>
+            <li><strong>Reconciliation Workers</strong> sweep anything stuck and verify it against the gateway.</li>
+          </ol>
+        </section>
+
+        <section id="takeaways">
+          <h2>🔑 Key design takeaways</h2>
+          <ul class="checks">
+            <li><strong>Idempotency</strong> prevents duplicate payment processing.</li>
+            <li><strong>Database transactions</strong> ensure atomic business and outbox updates.</li>
+            <li><strong>Outbox + CDC</strong> enables reliable asynchronous event publishing.</li>
+            <li><strong>Idempotent Kafka consumers</strong> handle duplicate event delivery.</li>
+            <li><strong>Reconciliation</strong> recovers from crashes, timeouts, and uncertain outcomes.</li>
+          </ul>
+          <div class="callout big">
+            <strong>The biggest learning:</strong> designing a payment system isn't just about
+            processing transactions. It's about ensuring <em>correctness</em> when requests are retried,
+            services crash, or external systems fail.
+          </div>
+        </section>
+
+      </article>
+      <footer>Payment System Design · high-level architecture notes · diagram rendered as SVG.</footer>
+    </main>
+  </div>
+
+  <script>
+    const themeBtn = document.getElementById('themeBtn');
+    const syncTheme = () => { themeBtn.textContent = document.documentElement.classList.contains('dark') ? '☀️' : '🌙'; };
+    syncTheme();
+    themeBtn.addEventListener('click', () => {
+      const dark = document.documentElement.classList.toggle('dark');
+      try { localStorage.setItem('ps-theme', dark ? 'dark' : 'light'); } catch(e){}
+      syncTheme();
+    });
+    const bar = document.getElementById('progress');
+    const onScroll = () => { const h = document.documentElement; const max = h.scrollHeight - h.clientHeight; bar.style.width = max > 0 ? (h.scrollTop/max*100)+'%' : '0%'; };
+    window.addEventListener('scroll', onScroll, { passive: true });
+  </script>
+</body>
+</html>
